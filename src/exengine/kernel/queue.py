@@ -1,9 +1,6 @@
 import queue
 import threading
 import warnings
-from typing import Generic, TypeVar
-
-from exengine.kernel.ex_event_base import ExecutorEvent
 
 # Abortable queue object used by the engine
 # For Python 3.13, such an object is provided by the standard library

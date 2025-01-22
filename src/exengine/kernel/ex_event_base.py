@@ -49,20 +49,16 @@ class ExecutorEvent(ABC, metaclass=_ExecutorEventMeta):
         self._priority = 1 # lower number means higher priority
         self._finished = False
         self._initialized = False
+        self.instance = None # Set to a DeviceBase object to run on the thread of that device.
         # Check for method-level preferred thread name first, then class-level
         self._thread_name = getattr(self.execute, '_thread_name', None) or getattr(self.__class__, '_thread_name', None)
 
-    def __lt__(self, other) -> bool:
-        """Implement the < operator to allow sorting events by priority"""
-        if other is None:
-            return True # always put 'None' at the end of the queue
-        return self._priority < other._priority
+    def can_start(self, condition) -> bool:
+        """
+        Check if the event can start execution. This method is called by the executor before starting the event.
+        """
+        return True
 
-    def __gt__(self, other) -> bool:
-        """Implement the > operator to allow sorting events by priority"""
-        if other is None:
-            return False
-        return self._priority > other._priority
 
     def _pre_execution(self, engine) -> ExecutionFuture:
         """
@@ -114,16 +110,24 @@ class ExecutorEvent(ABC, metaclass=_ExecutorEventMeta):
             return_value: Return value of the event
             exception: Exception that was raised during execution, if any
         """
-        if self._future_weakref is None:
-            raise Exception("Future not set for event")
-        self.finished = True
         try:
-            self._engine.publish_notification(EventExecutedNotification(payload=exception))
-        finally:
-            future = self._future_weakref()
-            if future is not None:
-                print(f"Event {self} finished, notifying future")
-                future._notify_execution_complete(return_value, exception)
+            if self._future_weakref is None:
+                raise Exception("Future not set for event")
+            self.finished = True
+            try:
+                if self._engine.__class__.__name__ != "ExecutionEngine":
+                    raise Exception("Engine is not an ExecutionEngine") # for debugging
+                self._engine.publish_notification(EventExecutedNotification(payload=exception))
+            finally:
+                future = self._future_weakref()
+                if future is not None:
+                    print(f"Event {self} finished, notifying future")
+                    future._notify_execution_complete(return_value, exception)
+        except Exception:
+            if exception is not None:
+                pass # don't raise an exception from inside the exception handler
+            else:
+                raise
 
 
 

@@ -25,10 +25,85 @@ _MAIN_THREAD_NAME = 'MainExecutorThread'
 _ANONYMOUS_THREAD_NAME = 'AnonymousExecutorThread'
 
 class DeviceBase:
-    __slots__ = ('_engine', '_device')
+    __slots__ = ('_engine', '_device', '_thread', '_queue', '_queue_condition')
     def __init__(self, engine, wrapped_device):
         self._engine = engine
         self._device = wrapped_device
+        self._thread = None
+        self._queue: list[ExecutorEvent] = []
+        self._queue_condition = threading.Condition()
+
+    def submit(self, event: Union[ExecutorEvent | Callable]) -> "ExecutionFuture":
+        """
+        Submit an event to run on the thread of this device
+
+        todo: add thread safety / locking
+        Thread safety / locking:
+            A device can be associated to a control thread (i.e. the `control_thread` attribute is set).
+            In that case, only the control thread may submit events to the device, and an exception is raised
+            if any other thread submits an event.
+            Each device is initially controlled by the thread that created it. The `control_thread` can be cleared
+            by calling `make_multi_threaded()`, enabling any thread to submit events to the device.
+            To obtain temporary exclusive control over a device, use the `with device:` syntax.
+            This will block until the ownership is released by the owning thread, and release control when the block is exited.
+        """
+        if not isinstance(event, ExecutorEvent):
+            event = AnonymousCallableEvent(event)
+        else:
+            if event._finished:
+                # this is unrecoverable, never retry
+                raise RuntimeError("Event ", event, " was already executed")
+
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run_thread)
+            self._thread.start()
+
+        # todo: rethink lifecycle of events. Perhaps the event itself can be the Future?
+        future = event._pre_execution(self._engine)
+        with self._queue_condition:
+            self._queue.append(event)
+            self._queue_condition.notify()
+
+        return future
+
+    def shutdown(self):
+        self._engine = None
+        self._device = None
+        if self._thread is not None:
+            self.submit(ShutdownEvent())
+            self._thread.join()
+            self._thread = None
+
+
+    def _run_thread(self):
+        """Device thread, executing events in order.
+
+        todo: implement event retry. Probably not here, but in the event class itself, allowing it to requeue itself on failure.
+        """
+        while True:
+            try:
+                with self._queue_condition:
+                    # Get the next event from the queue. Blocks until an event is available.
+                    while len(self._queue) == 0:
+                        self._queue_condition.wait()
+                    event = self._queue.pop(0)
+
+                    # Wait until the event can be executed
+                    # If the event is not ready to start, it is responsible for signalling the condition
+                    # as soon as some condition changes that may cause the event to be ready to start.
+                    # Note: this signalling should be done _from_a_different_thread_ and never from the can_start function itself.
+                    # or a deadlock will occur.
+                    while not event.can_start(self._queue_condition):
+                        self._queue_condition.wait()
+
+                result = event.execute()
+                event._post_execution(result)
+            except Exception as e:
+                self._engine._log_exception(e)
+                event._post_execution(exception=e)  # cannot raise an exception
+                if isinstance(e, Shutdown):
+                    break
+
 
 class MultipleExceptions(Exception):
     def __init__(self, exceptions: list[Exception]):
@@ -42,13 +117,40 @@ class ExecutionEngine:
     def __init__(self):
         self._exceptions = Queue()
         self._devices = {}
+        self._queue = []
+        self._queue_condition = threading.Condition()
+        self._workers = [threading.Thread(target=self._run_thread, name=f"ExecutorThread{i}") for i in range(4)]
         self._notification_queue = Queue()
         self._notification_subscribers: list[Callable[[Notification], None]] = []
         self._notification_subscriber_filters: list[Union[NotificationCategory, Type]] = []
         self._notification_lock = threading.Lock()
         self._notification_thread = None
-        self._thread_managers = {}
-        self._start_new_thread(_MAIN_THREAD_NAME)
+        for thread in self._workers:
+            thread.start()
+
+    def _run_thread(self):
+        """Main loop for worker threads.
+
+        A thread is stopped by sending a TerminateThreadEvent to it, which raises a Shutdown exception.
+        todo: refactor, code duplication with Device
+        """
+        while True:
+            with self._queue_condition:
+                # Finds the first event that is ready to start
+                event = next((e for e in self._queue if e.can_start(self._queue_condition)), None)
+                if event is None:
+                    self._queue_condition.wait()
+                    continue
+
+            self._queue.remove(event)
+            try:
+                result = event.execute()
+                event._post_execution(result)
+            except Exception as e:
+                self._log_exception(e)
+                event._post_execution(exception=e)  # cannot raise an exception
+                if isinstance(e, Shutdown):
+                    break
 
 
 
@@ -96,17 +198,17 @@ class ExecutionEngine:
             if inspect.isfunction(attribute):
                 def method(self, *args, _name=name, **kwargs):
                     event = MethodCallEvent(method_name=_name, args=args, kwargs=kwargs, instance=self._device)
-                    return self._engine.submit(event)
+                    return self.submit(event)
 
                 class_dict[name] = method
             else:
                 def getter(self, _name=name):
                     event = GetAttrEvent(attr_name=_name, instance=self._device, method=getattr)
-                    return self._engine.submit(event).await_execution()
+                    return self.submit(event).await_execution()
 
                 def setter(self, value, _name=name):
                     event = SetAttrEvent(attr_name=_name, value=value, instance=self._device, method=setattr)
-                    self._engine.submit(event).await_execution()
+                    self.submit(event).await_execution()
 
                 has_setter = not isinstance(attribute, property) or attribute.fset is not None
                 class_dict[name] = property(getter, setter if has_setter else None, None, f"Wrapped attribute {name}")
@@ -228,114 +330,59 @@ class ExecutionEngine:
             else:
                 raise MultipleExceptions(exceptions)
 
-    def submit(self, event_or_events: Union[ExecutorEvent, Iterable[ExecutorEvent], Callable], thread_name=None,
-               prioritize: bool = False, use_free_thread: bool = False) -> Union[ExecutionFuture, Iterable[ExecutionFuture]]:
+    def submit(self, event: Union[ExecutorEvent | Callable]) -> ExecutionFuture:
         """
-        Submit one or more acquisition events or callable objects for execution.
+        Submit an event for execution in the worker thread pool.
+        Events are executed as soon as the conditions for execution are met.
 
-        This method handles the submission of acquisition events or callable objects to be executed on active threads.
-        It provides options for event prioritization, thread allocation, and performance optimization.
+        The execution threads test if an event is ready to execute by calling the `can_start` method of the event.
+        If the event is not ready to start, the event is skipped and the next event is checked.
+        After all events have been checked, the threads are suspended.
+
+        Events that report can_start = False are responsible for waking up the suspended threads as soon as they become ready to be executed.
+        To enable this, can_start takes a notification listener as an argument, which is notified when the event becomes ready to start (or at least
+        needs to be re-evaluated).
+
+        todo: prioritize events?
 
 
-        Parameters:
-        -----------
-        event_or_events : Union[ExecutorEvent, Iterable[ExecutorEvent], Callable[[], Any], Iterable[Callable[[], Any]]]
-            A single ExecutorEvent, an iterable of ExecutorEvents, or a callable object with no arguments.
-
-        thread_name : str, optional (default=None)
-            Name of the thread to submit the event to. If None, the thread is determined by the
-            'use_free_thread' parameter.
-
-        prioritize : bool, optional (default=False)
-            If True, execute the event(s) before any others in the queue on its assigned thread.
-            Useful for system-wide changes affecting other events, like hardware adjustments.
-
-        use_free_thread : bool, optional (default=False)
-            If True, execute the event(s) on an available thread with an empty queue, creating a new thread if needed.
-            Useful for operations like cancelling or stopping events awaiting signals.
-            If False, execute on the primary thread.
+        See Also:
+            `DeviceBase.submit` for submitting events to a specific device.
 
         Returns:
         --------
-        Union[AcquisitionFuture, Iterable[AcquisitionFuture]]
-            For a single event or callable: returns a single ExecutionFuture.
-            For multiple events: returns an Iterable of ExecutionFutures.
+        ExecutionFuture.
 
         Notes:
         ------
-        - Use 'prioritize' for critical system changes that should occur before other queued events.
-        - 'use_free_thread' is essential for operations that need to run independently, like cancellation events.
         - If a callable object with no arguments is submitted, it will be automatically wrapped in a AnonymousCallableEvent.
         """
-        # Auto convert single callable to event
-        if callable(event_or_events) and len(inspect.signature(event_or_events).parameters) == 0:
-            event_or_events = AnonymousCallableEvent(event_or_events)
-
-        if isinstance(event_or_events, (ExecutorEvent, Callable)):
-            event_or_events = [event_or_events]
-
-        events = []
-        for event in event_or_events:
-            if callable(event):
-                events.append(AnonymousCallableEvent(event))
-            elif isinstance(event, ExecutorEvent):
-                events.append(event)
-            else:
-                raise TypeError(f"Invalid event type: {type(event)}. "
-                                f"Expected ExecutorEvent or callable with no arguments.")
-
-        futures = tuple(self._submit_single_event(event, thread_name or getattr(event, '_thread_name', None),
-                                                  use_free_thread, prioritize) for event in events)
-        if len(futures) == 1:
-            return futures[0]
-        return futures
-
-    def _submit_single_event(self, event: ExecutorEvent, thread_name=None, use_free_thread: bool = False,
-                             prioritize: bool = False):
-        """
-        Submit a single event for execution
-        """
-        future = event._pre_execution(self)
-        if use_free_thread:
-            need_new_thread = True
-            if thread_name is not None:
-                warnings.warn("thread_name may be ignored when use_free_thread is True")
-            # Iterate through main thread and anonymous threads
-            if self._thread_managers[_MAIN_THREAD_NAME].is_free():
-                self._thread_managers[_MAIN_THREAD_NAME].submit_event(event, prioritize=prioritize)
-                need_new_thread = False
-            else:
-                for tname in self._thread_managers.keys():
-                    if tname.startswith(_ANONYMOUS_THREAD_NAME) and self._thread_managers[tname].is_free():
-                        self._thread_managers[tname].submit_event(event, prioritize=prioritize)
-                        need_new_thread = False
-                        break
-            if need_new_thread:
-                num_anon_threads = len([tname for tn in self._thread_managers.keys() if
-                                        tn.startswith(_ANONYMOUS_THREAD_NAME)])
-                anonymous_thread_name = _ANONYMOUS_THREAD_NAME + str(num_anon_threads)
-                self._start_new_thread(anonymous_thread_name)
-                self._thread_managers[anonymous_thread_name].submit_event(event)
+        # Auto convert callable to event
+        if not isinstance(event, ExecutorEvent):
+            event = AnonymousCallableEvent(event)
         else:
-            if thread_name is not None:
-                if thread_name not in self._thread_managers:
-                    self._start_new_thread(thread_name)
-                self._thread_managers[thread_name].submit_event(event, prioritize=prioritize)
-            else:
-                self._thread_managers[_MAIN_THREAD_NAME].submit_event(event, prioritize=prioritize)
+            if event._finished:
+                # this is unrecoverable, never retry
+                raise RuntimeError("Event ", event, " was already executed")
+
+        # todo: rethink lifecycle of events. Perhaps the event itself can be the Future?
+        future = event._pre_execution(self)
+        with self._queue_condition:
+            self._queue.append(event)
+            self._queue_condition.notify()
 
         return future
 
     def shutdown(self):
         """
-        Stop all threads managed by this executor and wait for them to finish
+        Stop all devices, then stop all threads in the thread pool
         """
-        # For now just let the devices be garbage collected.
-        # TODO: add explicit shutdowns for devices here?
-        self._devices = None
-        for thread in self._thread_managers.values():
-            thread.shutdown()
-        for thread in self._thread_managers.values():
+        for device in self._devices.values():
+            device.shutdown()
+
+        for _ in self._workers:
+            self.submit(ShutdownEvent())
+        for thread in self._workers:
             thread.join()
 
         # Make sure the notification thread is stopped if it was started at all
@@ -369,59 +416,6 @@ class _ExecutionThreadManager:
 
     def join(self):
         self.thread.join()
-
-    def _run_thread(self):
-        """Main loop for worker threads.
-
-        A thread is stopped by sending a TerminateThreadEvent to it and optionally setting the _terminate_now flag.
-        When a TerminateThreadEvent is encountered in the queue, the thread will terminate and discard all subsequent events.
-        todo: possible race condition when high-priority event is added after termination event
-        If the _terminate_now flag is set, the thread will terminate as soon as possible.
-        """
-        return_val = None
-        try:
-            while True:
-                event = self._queue.get(block=True) # raises Shutdown exception when thread is shutting down
-                self._exception = None
-                try:
-                    if event._finished:
-                        # this is unrecoverable, never retry
-                        # todo: move this check to the submit code, this will give earlier and more accurate feedback
-                        event._retries_on_execution = 0
-                        raise RuntimeError("Event ", event, " was already executed")
-
-                    self._event_executing.set()
-                    if ExecutionEngine._debug:
-                        print("Executing event", event.__class__.__name__, threading.current_thread())
-                    return_val = event.execute()
-                    if ExecutionEngine._debug:
-                        print("Finished executing", event.__class__.__name__, threading.current_thread())
-                    self._event_executing.clear()
-
-                except Exception as e:
-                    if event._num_retries_on_exception > 0:
-                        event._num_retries_on_exception -= 1
-                        event.priority = 0 # reschedule with high priority
-                        # log warning and try again
-                        warnings.warn(f"{e} during execution of {event}" +
-                                  f", retrying {event._num_retries_on_exception} more times")
-                        continue # don't call post_execution just yet
-                    else:
-                        # give up
-                        self._engine._log_exception(e)
-                        self._exception = e
-
-                finally:
-                    self._queue.task_done()
-
-                try:
-                    event._post_execution(return_value=return_val, exception=self._exception)
-                except Exception as e:
-                    self._engine._log_exception(e)
-
-        except Shutdown:
-            pass
-
 
     def is_free(self):
         """
@@ -470,6 +464,9 @@ class MethodCallEvent(ExecutorEvent):
         method = getattr(self.instance, self.method_name)
         return method(*self.args, **self.kwargs)
 
+class ShutdownEvent(ExecutorEvent):
+    def execute(self):
+        raise Shutdown()
 
 class GetAttrEvent(ExecutorEvent):
 
@@ -480,7 +477,9 @@ class GetAttrEvent(ExecutorEvent):
         self.method = method
 
     def execute(self):
-        return self.method(self.instance, self.attr_name)
+        value = self.method(self.instance, self.attr_name)
+        print(f"Got {self.attr_name} with value {value}")
+        return value
 
 
 class SetAttrEvent(ExecutorEvent):
@@ -489,8 +488,11 @@ class SetAttrEvent(ExecutorEvent):
         super().__init__()
         self.attr_name = attr_name
         self.value = value
-        self.instance = instance
+        self.instance = instance # wrapped object
         self.method = method
 
     def execute(self):
         self.method(self.instance, self.attr_name, self.value)
+        print(f"Set {self.attr_name} to {self.value}")
+
+
