@@ -4,7 +4,7 @@ Class that executes acquistion events across a pool of threads
 import threading
 import traceback
 from dataclasses import dataclass
-from typing import Union, Iterable, Callable, Type, Dict, Any, Optional
+from typing import Union, Callable, Type, Dict, Any, Optional
 import queue
 import inspect
 
@@ -13,37 +13,8 @@ from .ex_event_base import ExecutorEvent, AnonymousCallableEvent
 from .ex_future import ExecutionFuture
 from .queue import Queue, Shutdown
 
-# todo: Add shutdown to __del__
-# todo: simplify worker threads:
-#   - remove enqueing on free thread -> replace by a thread pool mechanism
-#   - decouple enqueing and dequeing (related)
-#   - remove is_free and related overhead
-# todo: simplify ExecutorEvent class and lifecycle
-
 _MAIN_THREAD_NAME = 'MainExecutorThread'
 _ANONYMOUS_THREAD_NAME = 'AnonymousExecutorThread'
-
-class DebugLock():
-    def __init__(self):
-        self._lock = threading.Lock()
-
-    def __enter__(self):
-        self.acquire()
-
-    def __exit__(self, *args):
-        self.release()
-
-    def acquire(self, blocking=True, timeout=-1):
-        if blocking and timeout == -1:
-            while not self._lock.acquire(True, 1.0):
-                pass
-            return True
-        else:
-            self._lock.acquire(blocking, timeout)
-
-    def release(self):
-        self._lock.release()
-
 
 class DeviceBase:
     __slots__ = ('_engine', '_device', '_executor')
@@ -71,29 +42,35 @@ class DeviceBase:
             event = AnonymousCallableEvent(event)
         return self._executor.submit(event)
 
-    def shutdown(self, immediately=False, wait=True):
+    def abort(self):
+        """Abort all pending events on this device"""
+        self._executor.abort()
+
+    def _shutdown(self, immediately=False, wait=False):
         """
-        Terminates the device thread and destroys the device.
+        Terminates the device thread and destroys the underlying device object.
+
+        This function is called by the engine when the device is removed explicitly (see __delitem__) or when
+        the engine is shut down.
+        It performs the following actions (atomically):
+            - Clears all current events (if immediately is True)
+            - Schedule a shutdown event on the device thread, which removes the internal reference to the device, causing it to be garbage collected.
+            - Signals the device thread to finish
+
+        All subsequent access to the device will fail with a Shutdown exception because the thread is shut down.
+        todo: Devices or subsystems may require some actions for a graceful shutdown. How can the user/library developer specify this?
+
         Args:
             immediately: If True, all pending events are discarded.
                 If False, the device finishes all pending events before shutting down.
-            wait: If True, waits for the device thread to finish and the device to be destroyed
+            wait: If True, waits for the device thread to finish before returning. This should not really be necessary in most cases.
 
-            The device is not destroyed explicitly. Rather, the internal reference to the device is removed,
-            which will initiate garbage collection if there are no other references to the device.
         """
-        self._executor.shutdown(immediately, wait, self._on_shutdown)
+        def do_shutdown():
+            self._engine = None
+            self._device = None
 
-    def _on_shutdown(self):
-        self._engine = None
-        self._device = None
-
-
-class MultipleExceptions(Exception):
-    def __init__(self, exceptions: list[Exception]):
-        self.exceptions = exceptions
-        messages = [f"{type(e).__name__}: {''.join(traceback.format_exception(type(e), e, e.__traceback__))}" for e in exceptions]
-        super().__init__("Multiple exceptions occurred:\n" + "\n".join(messages))
+        self._executor.shutdown(immediately, wait, AnonymousCallableEvent(do_shutdown))
 
 class ExecutionEngine:
     _debug = False
@@ -257,6 +234,16 @@ class ExecutionEngine:
         """
         return self._devices[device_id]
 
+    def __delitem__(self, device_id: str):
+        """
+        Remove a device from the engine and shut it down.
+        If the device is still busy, it is allowed to finish what it was doing.
+        """
+        device = self._devices[device_id]
+        device._shutdown(immediately=False, wait=False)
+        del self._devices[device_id]
+
+
     @staticmethod
     def set_debug_mode(debug):
         ExecutionEngine._debug = debug
@@ -319,7 +306,9 @@ class ExecutionEngine:
             wait: If True, waits for the device thread to finish and the device to be destroyed
         """
         for device in self._devices.values():
-            device.shutdown(immediately, wait)
+            device._shutdown(immediately, False) # first signal all devices to shut down
+        for device in self._devices.values():
+            device._shutdown(immediately, True) # then wait for all devices to finish shutting down
 
         # this will terminate all workers
         self._workers[0].shutdown(immediately, wait)
@@ -345,7 +334,6 @@ class _ExecutionThreadManager:
             self._queue_condition = threading.Condition(lock=DebugLock())
             self._queue_condition.terminating = False # add custom property to the condition
 
-        self._termination_callback = None
         self._thread = threading.Thread(target=self._run_thread, name=name)
         self._thread.start()
 
@@ -371,7 +359,6 @@ class _ExecutionThreadManager:
         A thread is stopped by sending a TerminateThreadEvent to it, which raises a Shutdown exception.
         todo: refactor, code duplication with Device
         """
-        callback = None
         while True:
             with self._queue_condition:
                 event = None
@@ -385,8 +372,6 @@ class _ExecutionThreadManager:
                         self._queue.remove(event)
                 elif self._queue_condition.terminating:
                     # Queue empty and terminating.
-                    callback = self._termination_callback
-                    self._termination_callback = None
                     break
 
                 if event is None:
@@ -400,38 +385,44 @@ class _ExecutionThreadManager:
                 self._engine._log_exception(e)
                 event._post_execution(exception=e)  # cannot raise an exception
 
-        if callback is not None:
-            callback()
 
-    def shutdown(self, immediately=False, wait=True, callback: Optional[Callable] = None):
+    def shutdown(self, immediately:bool=False, wait:bool=True, final_event: Optional[ExecutorEvent]=None):
         """
         Shutdown the thread.
+
+        Calling this function multiple times is safe. When called with `immediately=True`, all pending events, including the final event, are discarded.
+        When multiple callse are made with `immediately=False`, all final_events are executed in the order they were provided.
 
         Args:
             immediately: If True, all pending events are discarded.
                 If False, the device finishes all pending events before shutting down.
             wait: If True, waits for the device thread to finish and the device to be destroyed
-            callback: Function to call when the thread is terminated (optional).
+            final_event: If provided, this final event is injected in the queue before shutting it down.
+                This final event is always executed.
+
 
         Raises:
             Shutdown: If the thread is already shutting down
         """
-        # install callback to call when thread is terminated
         with self._queue_condition:
-            if self._queue_condition.terminating:
-                raise Shutdown # we are already shutting down
-            if callback is not None:
-                self._termination_callback = callback
-
-            if immediately:
+            if immediately: # note: we cannot call 'abort' because the lock in the condition variable is not reentrant
                 for event in self._queue:
                     event._post_execution(exception=Shutdown()) # abort all events
                 self._queue.clear()
+            if final_event is not None:
+                self._queue.append(final_event)
             self._queue_condition.terminating = True
             self._queue_condition.notify_all()
 
         if wait:
             self._thread.join()
+
+    def abort(self):
+        """Abort all pending events on this device"""
+        with self._queue_condition:
+            for event in self._queue:
+                event._post_execution(exception=Shutdown()) # abort all events. Todo: custom exception?
+            self._queue.clear()
 
 
 @dataclass
@@ -479,3 +470,33 @@ class SetAttrEvent(ExecutorEvent):
         print(f"Set {self.attr_name} to {self.value}")
 
 
+class MultipleExceptions(Exception):
+    def __init__(self, exceptions: list[Exception]):
+        self.exceptions = exceptions
+        messages = [f"{type(e).__name__}: {''.join(traceback.format_exception(type(e), e, e.__traceback__))}" for e in exceptions]
+        super().__init__("Multiple exceptions occurred:\n" + "\n".join(messages))
+
+class DebugLock:
+    """Helper class for debugging deadlocks. Can be removed later.
+    It seems that the debugger cannot (always?) suspend threads that are blocked on a lock.
+    Therefore, we cannot use the debugger to inspect the state of the threads and identify readlocks.
+    As a partial workaround, put a breakpoint on the 'pass' line below to suspend a thread that is waiting for a DebugLock (used in Condition variables)."""
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        self.acquire()
+
+    def __exit__(self, *args):
+        self.release()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if blocking and timeout == -1:
+            while not self._lock.acquire(True, 1.0):
+                pass # breakpoint here
+            return True
+        else:
+            self._lock.acquire(blocking, timeout)
+
+    def release(self):
+        self._lock.release()
