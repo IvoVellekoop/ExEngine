@@ -84,6 +84,11 @@ def test_wrapping(engine):
     engine["object1"].value1 = 7
     assert wrapper.value1 == 7
 
+def test_shutdown(engine):
+    wrapper = engine.register("object1", TestObject())
+    engine.shutdown()
+
+
 def test_device_base_class(engine):
     class T(TestObject, Device):
         def __init__(self, _name, _engine):

@@ -345,7 +345,7 @@ class _ExecutionThreadManager:
             self._queue_condition = threading.Condition(lock=DebugLock())
             self._queue_condition.terminating = False # add custom property to the condition
 
-        self._terminiation_callback = None
+        self._termination_callback = None
         self._thread = threading.Thread(target=self._run_thread, name=name)
         self._thread.start()
 
@@ -374,22 +374,25 @@ class _ExecutionThreadManager:
         callback = None
         while True:
             with self._queue_condition:
-                if self._queue_condition.terminating:
-                    callback = self._terminiation_callback
-                    self._terminiation_callback = None
-                    break # end of processing
+                event = None
+                if len(self._queue) > 0:
+                    if self._sequential and self._queue[0].can_start(self._queue_condition):
+                        # Get the next event from the queue.
+                        event = self._queue.pop(0)
+                    else:
+                        # Finds the first event that is ready to start.
+                        event = next((e for e in self._queue if e.can_start(self._queue_condition)), None)
+                        self._queue.remove(event)
+                elif self._queue_condition.terminating:
+                    # Queue empty and terminating.
+                    callback = self._termination_callback
+                    self._termination_callback = None
+                    break
 
-                if self._sequential: # Get the next event from the queue. Blocks until an event is available.
-                    event = next((e for e in self._queue[:1] if e.can_start(self._queue_condition)), None)
-                else: # Finds the first event that is ready to start
-                    event = next((e for e in self._queue if e.can_start(self._queue_condition)), None)
                 if event is None:
-                    print("wait")
                     self._queue_condition.wait()
-                    print("finish wait")
                     continue
 
-            self._queue.remove(event)
             try:
                 result = event.execute()
                 event._post_execution(result)
@@ -418,9 +421,11 @@ class _ExecutionThreadManager:
             if self._queue_condition.terminating:
                 raise Shutdown # we are already shutting down
             if callback is not None:
-                self._terminiation_callback = callback
+                self._termination_callback = callback
 
             if immediately:
+                for event in self._queue:
+                    event._post_execution(exception=Shutdown()) # abort all events
                 self._queue.clear()
             self._queue_condition.terminating = True
             self._queue_condition.notify_all()
