@@ -85,6 +85,7 @@ def test_wrapping(engine):
     assert wrapper.value1 == 7
 
 def test_shutdown(engine):
+    "Performs an additional shutdown."
     wrapper = engine.register("object1", TestObject())
     engine.shutdown()
 

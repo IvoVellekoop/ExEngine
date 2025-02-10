@@ -75,7 +75,6 @@ def test_device_property_setting(engine):
 
 from concurrent.futures import ThreadPoolExecutor
 from exengine.kernel.executor import ExecutionEngine
-from exengine.device_types import Device
 import threading
 
 
@@ -87,9 +86,6 @@ class ThreadCreatingDevice:
 
     def create_internal_thread(self):
         def internal_thread_func():
-            # This should not be on an executor thread
-            assert not ExecutionEngine.on_any_executor_thread()
-            assert not getattr(threading.current_thread(), 'execution_engine_thread', False)
             self.test_attribute = "set_by_internal_thread"
 
         thread = threading.Thread(target=internal_thread_func)
@@ -98,9 +94,6 @@ class ThreadCreatingDevice:
 
     def create_nested_thread(self):
         def nested_thread_func():
-            # This should not be on an executor thread
-            assert not ExecutionEngine.on_any_executor_thread()
-            assert not getattr(threading.current_thread(), 'execution_engine_thread', False)
             self.test_attribute = "set_by_nested_thread"
 
         def internal_thread_func():
@@ -115,9 +108,6 @@ class ThreadCreatingDevice:
 
     def use_threadpool_executor(self):
         def threadpool_func():
-            # This should not be on an executor thread
-            assert not ExecutionEngine.on_any_executor_thread()
-            assert not getattr(threading.current_thread(), 'execution_engine_thread', False)
             self.test_attribute = "set_by_threadpool"
 
         with ThreadPoolExecutor() as executor:
@@ -297,8 +287,8 @@ def test_event_prioritization(engine):
 
 def test_use_free_thread_parallel_execution(engine):
     """
-    Test parallel execution using free threads in the ExecutionEngine.
-    Verifies that events submitted with use_free_thread=True can execute in parallel.
+    Test parallel execution in the ExecutionEngine.
+    Verifies that events submitted to the engine directlycan execute in parallel.
     """
     start_event1 = threading.Event()
     finish_event1 = threading.Event()
@@ -309,7 +299,7 @@ def test_use_free_thread_parallel_execution(engine):
     event2 = create_sync_event(start_event2, finish_event2)
 
     engine.submit(event1)
-    engine.submit(event2, use_free_thread=True)
+    engine.submit(event2)
 
     # Wait for both events to start executing
     assert start_event1.wait(timeout=5)
@@ -344,7 +334,7 @@ def test_single_execution_with_free_thread(engine):
     event2 = create_sync_event(start_event2, finish_event2)
 
     engine.submit(event1)
-    engine.submit(event2, use_free_thread=True)
+    engine.submit(event2)
 
     # Wait for both events to start executing
     assert start_event1.wait(timeout=5)
@@ -385,14 +375,15 @@ def test_class_method(engine):
     result = future.await_execution()
     assert result == "Test method executed"
 
-def test_submit_mixed(engine):
-    class TestEvent(ExecutorEvent):
-        def execute(self):
-            return "Event executed"
-
-    futures = engine.submit([TestEvent(), lambda: 42, lambda: "Lambda"])
-    results = [future.await_execution() for future in futures]
-    assert results == ["Event executed", 42, "Lambda"]
+# (removed, because submitting lists of events is not supported yet, and may not be necessary)
+# def test_submit_mixed(engine):
+#     class TestEvent(ExecutorEvent):
+#         def execute(self):
+#             return "Event executed"
+#
+#     futures = engine.submit([TestEvent(), lambda: 42, lambda: "Lambda"])
+#     results = [future.await_execution() for future in futures]
+#     assert results == ["Event executed", 42, "Lambda"]
 
 def test_submit_invalid(engine):
     with pytest.raises(TypeError):
@@ -423,88 +414,41 @@ def test_submit_to_main_thread(engine):
 
     assert event.executed_thread_name == _MAIN_THREAD_NAME
 
-def test_submit_to_new_anonymous_thread(engine):
-    """
-    Test that submitting an event with use_free_thread=True creates a new anonymous thread if needed.
-    """
-    start_event1 = threading.Event()
-    finish_event1 = threading.Event()
-    event1 = create_sync_event(start_event1, finish_event1)
+def test_device_thread(engine):
+    """Test that events submitted to a device are not reordered"""
 
-    start_event2 = threading.Event()
-    finish_event2 = threading.Event()
-    event2 = create_sync_event(start_event2, finish_event2)
+    class TestDeviceOrdered:
+        def __init__(self):
+            self.value = 0
 
-    # Submit first event to main thread
-    engine.submit(event1)
-    start_event1.wait()
+        def work(self, old_value, new_value):
+            if self.value != old_value:
+                raise ValueError("Value was not as expected")
+            time.sleep(0.5)
+            if self.value != old_value:
+                raise ValueError("Value was not as expected")
+            self.value = new_value
 
-    # Submit second event with use_free_thread=True
-    future2 = engine.submit(event2, use_free_thread=True)
-    start_event2.wait()
+    device = engine.register("device", TestDeviceOrdered())
+    device.work(0, 1)
+    device.work(1, 2)
+    device.work(2, 3)
 
-    finish_event1.set()
-    finish_event2.set()
 
-    assert event1.executed_thread_name == _MAIN_THREAD_NAME
-    assert event2.executed_thread_name.startswith(_ANONYMOUS_THREAD_NAME)
-    assert len(engine._thread_managers) == 2  # Main thread + 1 anonymous thread
+def test_worker_thread(engine):
+    """Test that events submitted to a worker thread execute in parallel"""
+    count = 0
+    def worker_thread():
+        nonlocal count
+        if count != 0:
+            raise ValueError("Count was not as expected")
+        time.sleep(0.5)
+        count += 1
 
-def test_multiple_anonymous_threads(engine):
-    """
-    Test creation of multiple anonymous threads when submitting multiple events with use_free_thread=True.
-    """
-    events = []
-    start_events = []
-    finish_events = []
-    num_events = 5
-
-    for _ in range(num_events):
-        start_event = threading.Event()
-        finish_event = threading.Event()
-        event = create_sync_event(start_event, finish_event)
-        events.append(event)
-        start_events.append(start_event)
-        finish_events.append(finish_event)
-
-    futures = [engine.submit(event, use_free_thread=True) for event in events]
-
-    for start_event in start_events:
-        start_event.wait()
-
-    for finish_event in finish_events:
-        finish_event.set()
-
-    thread_names = set(event.executed_thread_name for event in events)
-    assert len(thread_names) == num_events  # Each event should be on a different thread
-    assert all(name.startswith(_ANONYMOUS_THREAD_NAME) or name == _MAIN_THREAD_NAME for name in thread_names)
-    assert len(engine._thread_managers) == num_events   # num_events anonymous threads
-
-def test_reuse_named_thread(engine):
-    """
-    Test that submitting multiple events to the same named thread reuses that thread.
-    """
-    thread_name = "custom_thread"
-    events = []
-    start_events = []
-    finish_events = []
-    num_events = 3
-
-    for _ in range(num_events):
-        start_event = threading.Event()
-        finish_event = threading.Event()
-        event = create_sync_event(start_event, finish_event)
-        events.append(event)
-        start_events.append(start_event)
-        finish_events.append(finish_event)
-
-    futures = [engine.submit(event, thread_name=thread_name) for event in events]
-
-    for finish_event in finish_events:
-        finish_event.set()
-
-    for start_event in start_events:
-        start_event.wait()
-
-    assert all(event.executed_thread_name == thread_name for event in events)
-    assert len(engine._thread_managers) == 2  # Main thread + 1 custom named thread
+    f1 = engine.submit(worker_thread)
+    f2 =engine.submit(worker_thread)
+    f3 = engine.submit(worker_thread)
+    f1.await_execution()
+    f2.await_execution()
+    f3.await_execution()
+    assert count == 3

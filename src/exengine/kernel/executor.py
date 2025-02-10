@@ -38,8 +38,6 @@ class DeviceBase:
             To obtain temporary exclusive control over a device, use the `with device:` syntax.
             This will block until the ownership is released by the owning thread, and release control when the block is exited.
         """
-        if not isinstance(event, ExecutorEvent):
-            event = AnonymousCallableEvent(event)
         return self._executor.submit(event)
 
     def abort(self):
@@ -291,9 +289,6 @@ class ExecutionEngine:
         ------
         - If a callable object with no arguments is submitted, it will be automatically wrapped in a AnonymousCallableEvent.
         """
-        # Auto convert callable to event
-        if not isinstance(event, ExecutorEvent):
-            event = AnonymousCallableEvent(event)
         return self._workers[0].submit(event)
 
     def shutdown(self, immediately=False, wait=True):
@@ -337,7 +332,10 @@ class _ExecutionThreadManager:
         self._thread = threading.Thread(target=self._run_thread, name=name)
         self._thread.start()
 
-    def submit(self, event: ExecutorEvent) -> ExecutionFuture:
+    def submit(self, event: Union[ExecutorEvent | Callable]) -> ExecutionFuture:
+        if not isinstance(event, ExecutorEvent):
+            event = AnonymousCallableEvent(event)
+
         if self._queue_condition.terminating:
             raise Shutdown  # we are shutting down, so don't accept new events
 
@@ -357,7 +355,6 @@ class _ExecutionThreadManager:
         """Main loop for worker threads.
 
         A thread is stopped by sending a TerminateThreadEvent to it, which raises a Shutdown exception.
-        todo: refactor, code duplication with Device
         """
         while True:
             with self._queue_condition:
